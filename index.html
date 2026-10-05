@@ -145,15 +145,15 @@
 <body>
 
 <h1>🗂️ Flashcard Tətbiqi</h1>
-<div class="subtitle">Şəkil və ya PDF yüklə, sözləri avtomatik ayır, öyrən</div>
+<div class="subtitle">PDF, MD, TXT və ya şəkil yüklə, sözləri avtomatik ayır, öyrən</div>
 
 <!-- UPLOAD PANEL -->
 <div class="panel" id="uploadPanel">
   <label class="upload-box" id="uploadBox">
     <div class="icon">📄</div>
-    <div><strong>Şəkil və ya PDF seç</strong></div>
-    <div style="color:var(--muted); font-size:.8rem; margin-top:4px;">JPG, PNG və ya PDF faylı</div>
-    <input type="file" id="fileInput" accept="image/*,.pdf">
+    <div><strong>PDF, MD və ya şəkil seç</strong></div>
+    <div style="color:var(--muted); font-size:.8rem; margin-top:4px;">PDF, MD, TXT, JPG və ya PNG faylı</div>
+    <input type="file" id="fileInput" accept="image/*,.pdf,.md,.markdown,.txt,text/markdown,text/plain">
   </label>
   <div class="progress-bar" id="progressBar"><div id="progressFill"></div></div>
   <div class="status" id="statusText"></div>
@@ -220,6 +220,7 @@ let currentIndex = 0;
 let unknownWords = [];
 let isRetryRound = false;
 let isFlipped = false;
+let sourceKind = 'pdf'; // pdf | text (md/txt) | image — decides how strict the parser is
 
 fileInput.addEventListener('change', async (e) => {
   const file = e.target.files[0];
@@ -232,8 +233,13 @@ fileInput.addEventListener('change', async (e) => {
 
   try {
     let fullText = '';
-    if (file.type === 'application/pdf') {
+    const isPdf = file.type === 'application/pdf' || /\.pdf$/i.test(file.name);
+    const isText = !isPdf && (/\.(md|markdown|txt)$/i.test(file.name) || (file.type || '').startsWith('text/'));
+    sourceKind = isPdf ? 'pdf' : (isText ? 'text' : 'image');
+    if (isPdf) {
       fullText = await extractFromPDF(file);
+    } else if (isText) {
+      fullText = normalizeMarkdown(await file.text());
     } else {
       fullText = await extractFromImage(file);
     }
@@ -359,6 +365,40 @@ async function extractFromPDF(file) {
   return merged.join('\n');
 }
 
+// --- MARKDOWN / TXT SUPPORT ---
+// Turns common markdown into plain "N. word - meaning - russian" lines so the same
+// parser handles it: strips headings, quotes, bullet markers, bold/strike/code marks,
+// and converts table rows ("| 1 | word | meaning |") into dash-separated lines.
+function normalizeMarkdown(text) {
+  const rawLines = text.replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n').split('\n').map(l => l.trim());
+  const isSeparator = (l) => /^\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?$/.test(l) && l.includes('-');
+  const out = [];
+
+  for (let i = 0; i < rawLines.length; i++) {
+    let l = rawLines[i];
+    if (!l) continue;
+    if (isSeparator(l)) continue;                                   // | --- | --- |
+    // a table header row is followed by a separator row: skip it ("| Word | Meaning |")
+    if (l.includes('|') && i + 1 < rawLines.length && isSeparator(rawLines[i + 1])) continue;
+
+    l = l.replace(/^#{1,6}\s+/, '');                                // # headings
+    l = l.replace(/^>\s?/, '');                                     // > quotes
+    l = l.replace(/^[-*+]\s+/, '');                                 // - bullet / * bullet
+    l = l.replace(/(\*\*|__|~~|`)/g, '');                           // bold, strike, code
+
+    if (l.includes('|')) {                                          // table row -> "a - b - c"
+      const cells = l.split('|').map(c => c.trim()).filter(Boolean);
+      if (cells.length >= 2) {
+        l = /^\d+[.)]?$/.test(cells[0]) && cells.length >= 3
+          ? cells[0].replace(/[.)]$/, '') + '. ' + cells.slice(1).join(' - ')
+          : cells.join(' - ');
+      }
+    }
+    out.push(l.trim());
+  }
+  return out.join('\n');
+}
+
 // --- PARSING LOGIC ---
 // Split only on " - " (dash with a space on BOTH sides) so hyphenated words like
 // "tez-tez" or "break-off" are never split.
@@ -370,7 +410,9 @@ function splitOnSpacedDash(line) {
   return line.split(/\s[-\u2013\u2014]\s/);
 }
 
-function parseText(text) {
+// requireNumber=true (PDF/image): only lines starting with "N." count, which filters out
+// page numbers/headers. For md/txt files lines don't have to be numbered.
+function parseText(text, requireNumber = true) {
   let lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
 
   // Cut off a "Synonyms" section if present — it uses a different format
@@ -392,7 +434,7 @@ function parseText(text) {
   for (const line of lines) {
     // Only treat lines that actually begin with a number as dictionary entries —
     // this avoids stray headers/footers (e.g. a lone page number) being parsed.
-    if (!numberStart.test(line)) continue;
+    if (requireNumber && !numberStart.test(line)) continue;
 
     const parts = splitOnSpacedDash(line);
     if (parts.length < 2) continue; // no valid " - " separator, skip
@@ -405,7 +447,7 @@ function parseText(text) {
 
     // Strip a trailing page-number artifact that can get glued onto the last
     // entry of a page (e.g. "... получать, принять 253")
-    meaningPart = meaningPart.replace(/\s+\d{1,4}$/, '').trim();
+    if (requireNumber) meaningPart = meaningPart.replace(/\s+\d{1,4}$/, '').trim();
 
     if (!termPart || !meaningPart) continue;
 
@@ -420,7 +462,7 @@ function parseText(text) {
 
 document.getElementById('parseBtn').addEventListener('click', () => {
   const text = rawPreview.value;
-  words = parseText(text);
+  words = parseText(text, sourceKind !== 'text');
   if (words.length === 0) {
     statusText.textContent = 'Heç bir söz tapılmadı. Mətni yoxla (" - " formatına uyğun olmalıdır).';
     return;
